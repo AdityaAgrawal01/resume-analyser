@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 import google.generativeai as genai
 import psycopg2
+import boto3
 
 def get_db_connection():
     conn = psycopg2.connect(
@@ -15,13 +16,13 @@ def get_db_connection():
     )
     return conn
 
-def save_to_db(resume_text, job_description, match_score, analysis_result):
+def save_to_db(resume_text, job_description, match_score, analysis_result, s3_url):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO analyses (resume_text, job_description, match_score, analysis_result)
-        VALUES (%s, %s, %s, %s)
-    """, (resume_text, job_description, match_score, analysis_result))
+        INSERT INTO analyses (resume_text, job_description, match_score, analysis_result, s3_url)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (resume_text, job_description, match_score, analysis_result, s3_url))
     conn.commit()
     cur.close()
     conn.close()
@@ -31,6 +32,17 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 2. App creation
 app = Flask(__name__)
+
+def upload_to_s3(file, filename):
+    s3 = boto3.client(
+        's3',
+        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+        region_name=os.getenv('AWS_REGION')
+    )
+    s3.upload_fileobj(file, os.getenv('AWS_BUCKET_NAME'), filename)
+    url = f"https://{os.getenv('AWS_BUCKET_NAME')}.s3.{os.getenv('AWS_REGION')}.amazonaws.com/{filename}"
+    return url
 
 # 3. Helper function
 def extract_text(pdf_file):
@@ -83,10 +95,22 @@ def upload():
 def analyze():
     userfile = request.files['resume']
     jd = request.form['job_description']
-    resume_text = extract_text(userfile)
+    
+    # Read file into memory once
+    import io
+    file_content = userfile.read()
+    filename = userfile.filename
+    
+    # Upload to S3
+    s3_url = upload_to_s3(io.BytesIO(file_content), filename)
+    
+    # Extract text
+    resume_text = extract_text(io.BytesIO(file_content))
+    
+    # Analyze
     analysis = analyze_resume(resume_text, jd)
     
-    # Extract match score from analysis text
+    # Extract match score
     match_score = 0
     for line in analysis.split('\n'):
         if 'MATCH SCORE' in line:
@@ -96,7 +120,7 @@ def analyze():
                 match_score = 0
     
     # Save to database
-    save_to_db(resume_text, jd, match_score, analysis)
+    save_to_db(resume_text, jd, match_score, analysis, s3_url)
     
     return render_template('result.html', analysis=analysis)
 
